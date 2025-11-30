@@ -957,7 +957,7 @@ def plot_noi_trend(pro_forma: pd.DataFrame):
         height=400
     )
     
-    fig.update_yaxis(tickformat='$,.0f')
+    fig.update_yaxes(tickformat='$,.0f')
     
     return fig
 
@@ -998,7 +998,7 @@ def plot_cash_flow_waterfall(returns: Dict, inputs: PropertyInputs):
         showlegend=False
     )
     
-    fig.update_yaxis(tickformat='$,.0f')
+    fig.update_yaxes(tickformat='$,.0f')
     
     return fig
 
@@ -1051,8 +1051,7 @@ def plot_revenue_expense_stack(pro_forma: pd.DataFrame):
         barmode='group'
     )
     
-    fig.update_yaxis(tickformat='$,.0f')
-    fig.update_yaxis(tickformat='$,.0f', secondary_y=False)
+    fig.update_yaxes(tickformat='$,.0f')
     
     return fig
 
@@ -1089,7 +1088,7 @@ def plot_cumulative_cash_flow(pro_forma: pd.DataFrame, inputs: PropertyInputs):
         height=400
     )
     
-    fig.update_yaxis(tickformat='$,.0f')
+    fig.update_yaxes(tickformat='$,.0f')
     
     return fig
 
@@ -1336,7 +1335,7 @@ def main():
             color='Cash_on_Cash',
             color_continuous_scale='RdYlGn'
         )
-        fig.update_yaxis(tickformat='.1%')
+        fig.update_yaxes(tickformat='.1%')
         fig.update_layout(template='plotly_white', height=400)
         st.plotly_chart(fig, use_container_width=True)
     
