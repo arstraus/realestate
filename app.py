@@ -283,6 +283,11 @@ class PropertyInputs:
     capex_reserve_psf: float
     initial_ti: float
     
+    # Tax Assumptions
+    tax_rate: float
+    land_value_pct: float
+    depreciation_period: int
+    
     # Exit Assumptions
     hold_period_years: int
     exit_cap_rate: float
@@ -380,6 +385,13 @@ class CREAnalyzer:
         years = range(0, self.inputs.hold_period_years + 1)
         data = []
         
+        # Calculate depreciable basis (building value only, excluding land)
+        depreciable_basis = self.inputs.purchase_price * (1 - self.inputs.land_value_pct)
+        annual_depreciation = depreciable_basis / self.inputs.depreciation_period
+        
+        # Track cumulative principal paid for loan balance calculation
+        remaining_balance = self.inputs.loan_amount
+        
         for year in years:
             year_data = {'Year': year}
             
@@ -439,21 +451,44 @@ class CREAnalyzer:
             
             total_capex = ti + capex_reserve
             
-            # Cash Flow
+            # Debt Service and Amortization
             if year == 0:
                 debt_service = 0
+                interest_expense = 0
+                principal_payment = 0
             else:
                 debt_service = self.inputs.annual_debt_service
+                # Calculate interest on remaining balance
+                interest_expense = remaining_balance * self.inputs.interest_rate
+                principal_payment = debt_service - interest_expense
+                # Update remaining balance for next year
+                remaining_balance -= principal_payment
             
+            # Tax Calculations
+            if year == 0:
+                depreciation = 0
+                taxable_income = 0
+                tax_liability = 0
+            else:
+                depreciation = annual_depreciation
+                # Taxable Income = NOI - Interest - Depreciation
+                taxable_income = noi - interest_expense - depreciation
+                # Tax only on positive taxable income
+                tax_liability = max(0, taxable_income * self.inputs.tax_rate)
+            
+            # Cash Flow Calculations
             pre_tax_cash_flow = noi - debt_service - total_capex
+            after_tax_cash_flow = pre_tax_cash_flow - tax_liability
             
             # Debt metrics
             if year > 0 and debt_service > 0:
                 dscr = noi / debt_service
-                cash_on_cash = pre_tax_cash_flow / self.inputs.equity_required
+                pre_tax_coc = pre_tax_cash_flow / self.inputs.equity_required
+                after_tax_coc = after_tax_cash_flow / self.inputs.equity_required
             else:
                 dscr = 0
-                cash_on_cash = 0
+                pre_tax_coc = 0
+                after_tax_coc = 0
             
             year_data.update({
                 'Rent_PSF': rent_psf,
@@ -475,9 +510,17 @@ class CREAnalyzer:
                 'CapEx_Reserve': capex_reserve,
                 'Total_CapEx': total_capex,
                 'Debt_Service': debt_service,
+                'Interest_Expense': interest_expense,
+                'Principal_Payment': principal_payment,
+                'Loan_Balance': remaining_balance,
+                'Depreciation': depreciation,
+                'Taxable_Income': taxable_income,
+                'Tax_Liability': tax_liability,
                 'Pre_Tax_Cash_Flow': pre_tax_cash_flow,
+                'After_Tax_Cash_Flow': after_tax_cash_flow,
                 'DSCR': dscr,
-                'Cash_on_Cash': cash_on_cash
+                'Pre_Tax_CoC': pre_tax_coc,
+                'After_Tax_CoC': after_tax_coc
             })
             
             data.append(year_data)
@@ -498,44 +541,58 @@ class CREAnalyzer:
         sale_costs = gross_sale_price * self.inputs.sale_costs_pct
         net_sale_proceeds = gross_sale_price - sale_costs
         
-        # Loan balance at exit
-        if self.inputs.interest_rate > 0:
-            remaining_periods = self.inputs.loan_term_years - self.inputs.hold_period_years
-            if remaining_periods > 0:
-                loan_balance = npf.pv(
-                    self.inputs.interest_rate,
-                    remaining_periods,
-                    -self.inputs.annual_debt_service
-                )
-            else:
-                loan_balance = 0
-        else:
-            loan_balance = self.inputs.loan_amount - (self.inputs.annual_debt_service * self.inputs.hold_period_years)
+        # Loan balance at exit (from pro forma tracking)
+        loan_balance = self.pro_forma.loc[final_year, 'Loan_Balance']
         
-        net_cash_from_sale = net_sale_proceeds - loan_balance
+        # Calculate tax on sale
+        # Capital Gain = Sale Price - Original Basis
+        original_basis = self.inputs.purchase_price
+        capital_gain = gross_sale_price - original_basis
         
-        # Return calculations
-        total_cash_flow = self.pro_forma.loc[1:final_year, 'Pre_Tax_Cash_Flow'].sum()
-        total_cash_returned = total_cash_flow + net_cash_from_sale
-        total_profit = total_cash_returned - self.inputs.equity_required
+        # Depreciation Recapture
+        total_depreciation = self.pro_forma.loc[1:final_year, 'Depreciation'].sum()
+        depreciation_recapture = total_depreciation
         
-        equity_multiple = total_cash_returned / self.inputs.equity_required
-        avg_cash_on_cash = self.pro_forma.loc[1:final_year, 'Cash_on_Cash'].mean()
+        # Tax on sale (simplified: depreciation recapture at 25%, capital gains at ordinary rate)
+        depreciation_recapture_tax = depreciation_recapture * 0.25
+        capital_gains_tax = (capital_gain - depreciation_recapture) * self.inputs.tax_rate
+        total_tax_on_sale = depreciation_recapture_tax + capital_gains_tax
         
-        # IRR calculation
-        cash_flows = [-self.inputs.equity_required]
-        cash_flows.extend(self.pro_forma.loc[1:final_year, 'Pre_Tax_Cash_Flow'].tolist())
-        cash_flows[-1] += net_cash_from_sale
-        irr = npf.irr(cash_flows)
+        # Net cash from sale (after paying off loan and taxes)
+        net_cash_from_sale = net_sale_proceeds - loan_balance - total_tax_on_sale
         
-        # NPV calculation
-        npv = npf.npv(self.inputs.discount_rate, cash_flows)
+        # Pre-Tax Return calculations
+        pre_tax_total_cash_flow = self.pro_forma.loc[1:final_year, 'Pre_Tax_Cash_Flow'].sum()
+        pre_tax_cash_flows = [-self.inputs.equity_required]
+        pre_tax_cash_flows.extend(self.pro_forma.loc[1:final_year, 'Pre_Tax_Cash_Flow'].tolist())
+        pre_tax_cash_flows[-1] += (net_sale_proceeds - loan_balance)  # Pre-tax sale proceeds
+        
+        pre_tax_total_returned = pre_tax_total_cash_flow + (net_sale_proceeds - loan_balance)
+        pre_tax_profit = pre_tax_total_returned - self.inputs.equity_required
+        pre_tax_equity_multiple = pre_tax_total_returned / self.inputs.equity_required
+        pre_tax_avg_coc = self.pro_forma.loc[1:final_year, 'Pre_Tax_CoC'].mean()
+        pre_tax_irr = npf.irr(pre_tax_cash_flows)
+        pre_tax_npv = npf.npv(self.inputs.discount_rate, pre_tax_cash_flows)
+        
+        # After-Tax Return calculations
+        after_tax_total_cash_flow = self.pro_forma.loc[1:final_year, 'After_Tax_Cash_Flow'].sum()
+        after_tax_cash_flows = [-self.inputs.equity_required]
+        after_tax_cash_flows.extend(self.pro_forma.loc[1:final_year, 'After_Tax_Cash_Flow'].tolist())
+        after_tax_cash_flows[-1] += net_cash_from_sale  # After-tax sale proceeds
+        
+        after_tax_total_returned = after_tax_total_cash_flow + net_cash_from_sale
+        after_tax_profit = after_tax_total_returned - self.inputs.equity_required
+        after_tax_equity_multiple = after_tax_total_returned / self.inputs.equity_required
+        after_tax_avg_coc = self.pro_forma.loc[1:final_year, 'After_Tax_CoC'].mean()
+        after_tax_irr = npf.irr(after_tax_cash_flows)
+        after_tax_npv = npf.npv(self.inputs.discount_rate, after_tax_cash_flows)
         
         # Year 1 metrics
         year1_noi = self.pro_forma.loc[1, 'NOI']
         going_in_cap_rate = year1_noi / self.inputs.purchase_price
         year1_dscr = self.pro_forma.loc[1, 'DSCR']
-        year1_coc = self.pro_forma.loc[1, 'Cash_on_Cash']
+        year1_pre_tax_coc = self.pro_forma.loc[1, 'Pre_Tax_CoC']
+        year1_after_tax_coc = self.pro_forma.loc[1, 'After_Tax_CoC']
         
         self.returns = {
             'year_after_noi': year_after_noi,
@@ -543,19 +600,47 @@ class CREAnalyzer:
             'sale_costs': sale_costs,
             'net_sale_proceeds': net_sale_proceeds,
             'loan_balance': loan_balance,
+            'total_depreciation': total_depreciation,
+            'depreciation_recapture_tax': depreciation_recapture_tax,
+            'capital_gains_tax': capital_gains_tax,
+            'total_tax_on_sale': total_tax_on_sale,
             'net_cash_from_sale': net_cash_from_sale,
-            'total_cash_flow': total_cash_flow,
-            'total_cash_returned': total_cash_returned,
-            'total_profit': total_profit,
-            'equity_multiple': equity_multiple,
-            'avg_cash_on_cash': avg_cash_on_cash,
-            'irr': irr,
-            'npv': npv,
+            
+            # Pre-Tax Returns
+            'pre_tax_total_cash_flow': pre_tax_total_cash_flow,
+            'pre_tax_total_returned': pre_tax_total_returned,
+            'pre_tax_profit': pre_tax_profit,
+            'pre_tax_equity_multiple': pre_tax_equity_multiple,
+            'pre_tax_avg_coc': pre_tax_avg_coc,
+            'pre_tax_irr': pre_tax_irr,
+            'pre_tax_npv': pre_tax_npv,
+            
+            # After-Tax Returns
+            'after_tax_total_cash_flow': after_tax_total_cash_flow,
+            'after_tax_total_returned': after_tax_total_returned,
+            'after_tax_profit': after_tax_profit,
+            'after_tax_equity_multiple': after_tax_equity_multiple,
+            'after_tax_avg_coc': after_tax_avg_coc,
+            'after_tax_irr': after_tax_irr,
+            'after_tax_npv': after_tax_npv,
+            
+            # Year 1 Metrics
             'year1_noi': year1_noi,
             'going_in_cap_rate': going_in_cap_rate,
             'year1_dscr': year1_dscr,
-            'year1_coc': year1_coc,
-            'cash_flows': cash_flows
+            'year1_pre_tax_coc': year1_pre_tax_coc,
+            'year1_after_tax_coc': year1_after_tax_coc,
+            
+            # For backwards compatibility
+            'total_cash_flow': after_tax_total_cash_flow,
+            'total_cash_returned': after_tax_total_returned,
+            'total_profit': after_tax_profit,
+            'equity_multiple': after_tax_equity_multiple,
+            'avg_cash_on_cash': after_tax_avg_coc,
+            'irr': after_tax_irr,
+            'npv': after_tax_npv,
+            'year1_coc': year1_after_tax_coc,
+            'cash_flows': after_tax_cash_flows
         }
         
         return self.returns
@@ -799,6 +884,33 @@ def create_inputs_sidebar() -> PropertyInputs:
             step=0.05
         )
     
+    with st.sidebar.expander("TAX ASSUMPTIONS (LLC)", expanded=True):
+        st.markdown("*LLC is typically pass-through to owner's tax rate*")
+        tax_rate = st.slider(
+            "Tax Rate (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(default_inputs.tax_rate * 100) if default_inputs else 37.0,
+            step=1.0,
+            help="Combined federal + state tax rate (e.g., 37% federal + state)"
+        ) / 100
+        land_value_pct = st.slider(
+            "Land Value (% of Purchase Price)",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(default_inputs.land_value_pct * 100) if default_inputs else 20.0,
+            step=5.0,
+            help="Land is not depreciable; typical range 15-25%"
+        ) / 100
+        depreciation_period = st.number_input(
+            "Depreciation Period (Years)",
+            min_value=1,
+            max_value=50,
+            value=int(default_inputs.depreciation_period) if default_inputs else 39,
+            step=1,
+            help="Commercial real estate: 39 years (IRS)"
+        )
+    
     with st.sidebar.expander("EXIT ASSUMPTIONS", expanded=True):
         hold_period_years = st.number_input(
             "Hold Period (Years)",
@@ -849,6 +961,9 @@ def create_inputs_sidebar() -> PropertyInputs:
         repairs_maintenance=repairs_maintenance,
         capex_reserve_psf=capex_reserve_psf,
         initial_ti=initial_ti,
+        tax_rate=tax_rate,
+        land_value_pct=land_value_pct,
+        depreciation_period=depreciation_period,
         hold_period_years=hold_period_years,
         exit_cap_rate=exit_cap_rate,
         sale_costs_pct=sale_costs_pct,
@@ -879,48 +994,85 @@ def display_acquisition_summary(inputs: PropertyInputs):
 
 def display_key_metrics(returns: Dict):
     """Display key investment return metrics"""
-    st.markdown('<div class="sub-header">Key Investment Metrics</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">After-Tax Investment Returns</div>', unsafe_allow_html=True)
     
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.metric(
-            "IRR",
-            f"{returns['irr']*100:.2f}%",
-            help="Internal Rate of Return"
+            "After-Tax IRR",
+            f"{returns['after_tax_irr']*100:.2f}%",
+            help="Internal Rate of Return (after taxes)"
         )
     
     with col2:
         st.metric(
             "Equity Multiple",
-            f"{returns['equity_multiple']:.2f}x",
-            help="Total cash returned / Equity invested"
+            f"{returns['after_tax_equity_multiple']:.2f}x",
+            help="Total after-tax cash / Equity invested"
         )
     
     with col3:
         st.metric(
             "Avg Cash-on-Cash",
-            f"{returns['avg_cash_on_cash']*100:.2f}%",
-            help="Average annual cash return on equity"
+            f"{returns['after_tax_avg_coc']*100:.2f}%",
+            help="Average annual after-tax cash return"
         )
     
     with col4:
         st.metric(
-            "NPV",
-            f"${returns['npv']:,.0f}",
-            help="Net Present Value"
+            "After-Tax NPV",
+            f"${returns['after_tax_npv']:,.0f}",
+            help="Net Present Value (after taxes)"
         )
     
     with col5:
         st.metric(
             "Total Profit",
-            f"${returns['total_profit']:,.0f}",
-            help="Total cash returned - Equity invested"
+            f"${returns['after_tax_profit']:,.0f}",
+            help="Total after-tax profit"
+        )
+    
+    # Pre-Tax Comparison
+    st.markdown('<div class="sub-header">Pre-Tax Returns (for comparison)</div>', unsafe_allow_html=True)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Pre-Tax IRR",
+            f"{returns['pre_tax_irr']*100:.2f}%",
+            delta=f"{(returns['pre_tax_irr'] - returns['after_tax_irr'])*100:.2f}%",
+            delta_color="off"
+        )
+    
+    with col2:
+        st.metric(
+            "Pre-Tax Multiple",
+            f"{returns['pre_tax_equity_multiple']:.2f}x",
+            delta=f"{(returns['pre_tax_equity_multiple'] - returns['after_tax_equity_multiple']):.2f}x",
+            delta_color="off"
+        )
+    
+    with col3:
+        st.metric(
+            "Pre-Tax CoC",
+            f"{returns['pre_tax_avg_coc']*100:.2f}%",
+            delta=f"{(returns['pre_tax_avg_coc'] - returns['after_tax_avg_coc'])*100:.2f}%",
+            delta_color="off"
+        )
+    
+    with col4:
+        total_taxes = returns['pre_tax_profit'] - returns['after_tax_profit']
+        st.metric(
+            "Total Taxes Paid",
+            f"${total_taxes:,.0f}",
+            help="Total tax liability over hold period + exit"
         )
     
     # Year 1 metrics
     st.markdown('<div class="sub-header">Year 1 Metrics</div>', unsafe_allow_html=True)
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.metric("Year 1 NOI", f"${returns['year1_noi']:,.0f}")
@@ -932,7 +1084,18 @@ def display_key_metrics(returns: Dict):
         st.metric("Year 1 DSCR", f"{returns['year1_dscr']:.2f}")
     
     with col4:
-        st.metric("Year 1 Cash-on-Cash", f"{returns['year1_coc']*100:.2f}%")
+        st.metric(
+            "Y1 After-Tax CoC", 
+            f"{returns['year1_after_tax_coc']*100:.2f}%",
+            help="Year 1 After-Tax Cash-on-Cash"
+        )
+    
+    with col5:
+        st.metric(
+            "Y1 Pre-Tax CoC", 
+            f"{returns['year1_pre_tax_coc']*100:.2f}%",
+            help="Year 1 Pre-Tax Cash-on-Cash"
+        )
 
 
 def plot_noi_trend(pro_forma: pd.DataFrame):
@@ -1093,6 +1256,56 @@ def plot_cumulative_cash_flow(pro_forma: pd.DataFrame, inputs: PropertyInputs):
     return fig
 
 
+def plot_annual_cash_flow(pro_forma: pd.DataFrame):
+    """Plot annual cash flow distribution (pre-tax and after-tax)"""
+    # Filter out Year 0
+    annual_df = pro_forma[pro_forma['Year'] > 0].copy()
+    
+    fig = go.Figure()
+    
+    # Add zero line
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    
+    # Pre-tax cash flow
+    fig.add_trace(go.Bar(
+        x=annual_df['Year'],
+        y=annual_df['Pre_Tax_Cash_Flow'],
+        name='Pre-Tax',
+        marker_color='#9467bd',
+        opacity=0.7
+    ))
+    
+    # After-tax cash flow
+    fig.add_trace(go.Bar(
+        x=annual_df['Year'],
+        y=annual_df['After_Tax_Cash_Flow'],
+        name='After-Tax',
+        marker_color='#667eea'
+    ))
+    
+    fig.update_layout(
+        title='Annual Cash Flow to Equity (Pre-Tax vs After-Tax)',
+        xaxis_title='Year',
+        yaxis_title='Cash Flow ($)',
+        hovermode='x unified',
+        template='plotly_white',
+        height=400,
+        barmode='group',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    fig.update_yaxes(tickformat='$,.0f')
+    fig.update_xaxes(dtick=1)
+    
+    return fig
+
+
 def create_sensitivity_table(inputs: PropertyInputs, param1: str, param2: str, 
                              metric: str, param1_range: List[float], 
                              param2_range: List[float]) -> pd.DataFrame:
@@ -1225,30 +1438,33 @@ def display_pro_forma_table(pro_forma: pd.DataFrame):
     
     # Select key columns to display
     display_columns = [
-        'Year', 'Gross_Rental_Income', 'Other_Income', 'Total_Revenue',
-        'Total_Landlord_Expenses', 'NOI', 'Total_CapEx', 'Debt_Service',
-        'Pre_Tax_Cash_Flow', 'DSCR', 'Cash_on_Cash'
+        'Year', 'Gross_Rental_Income', 'Total_Revenue', 'Total_Landlord_Expenses', 'NOI',
+        'Debt_Service', 'Interest_Expense', 'Depreciation', 'Taxable_Income', 'Tax_Liability',
+        'Pre_Tax_Cash_Flow', 'After_Tax_Cash_Flow', 'DSCR', 'After_Tax_CoC'
     ]
     
     display_df = pro_forma[display_columns].copy()
     
     # Format for display
     display_df['Gross_Rental_Income'] = display_df['Gross_Rental_Income'].apply(lambda x: f"${x:,.0f}")
-    display_df['Other_Income'] = display_df['Other_Income'].apply(lambda x: f"${x:,.0f}")
     display_df['Total_Revenue'] = display_df['Total_Revenue'].apply(lambda x: f"${x:,.0f}")
     display_df['Total_Landlord_Expenses'] = display_df['Total_Landlord_Expenses'].apply(lambda x: f"${x:,.0f}")
     display_df['NOI'] = display_df['NOI'].apply(lambda x: f"${x:,.0f}")
-    display_df['Total_CapEx'] = display_df['Total_CapEx'].apply(lambda x: f"${x:,.0f}")
     display_df['Debt_Service'] = display_df['Debt_Service'].apply(lambda x: f"${x:,.0f}")
+    display_df['Interest_Expense'] = display_df['Interest_Expense'].apply(lambda x: f"${x:,.0f}")
+    display_df['Depreciation'] = display_df['Depreciation'].apply(lambda x: f"${x:,.0f}")
+    display_df['Taxable_Income'] = display_df['Taxable_Income'].apply(lambda x: f"${x:,.0f}")
+    display_df['Tax_Liability'] = display_df['Tax_Liability'].apply(lambda x: f"${x:,.0f}")
     display_df['Pre_Tax_Cash_Flow'] = display_df['Pre_Tax_Cash_Flow'].apply(lambda x: f"${x:,.0f}")
+    display_df['After_Tax_Cash_Flow'] = display_df['After_Tax_Cash_Flow'].apply(lambda x: f"${x:,.0f}")
     display_df['DSCR'] = display_df['DSCR'].apply(lambda x: f"{x:.2f}" if x > 0 else "-")
-    display_df['Cash_on_Cash'] = display_df['Cash_on_Cash'].apply(lambda x: f"{x*100:.2f}%" if x != 0 else "-")
+    display_df['After_Tax_CoC'] = display_df['After_Tax_CoC'].apply(lambda x: f"{x*100:.2f}%" if x != 0 else "-")
     
     # Rename columns for display
     display_df.columns = [
-        'Year', 'Gross Rental', 'Other Income', 'Total Revenue',
-        'Operating Exp', 'NOI', 'CapEx', 'Debt Service',
-        'Pre-Tax CF', 'DSCR', 'CoC %'
+        'Year', 'Rental Income', 'Total Revenue', 'Op Expenses', 'NOI',
+        'Debt Service', 'Interest', 'Depreciation', 'Taxable Inc', 'Taxes',
+        'Pre-Tax CF', 'After-Tax CF', 'DSCR', 'AT CoC %'
     ]
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -1310,29 +1526,56 @@ def main():
             st.metric("Gross Sale Price", f"${returns['gross_sale_price']:,.0f}")
         
         with col2:
-            st.metric("Sale Costs", f"${returns['sale_costs']:,.0f}")
+            st.metric("Net Sale Proceeds", f"${returns['net_sale_proceeds']:,.0f}")
         
         with col3:
             st.metric("Loan Balance", f"${returns['loan_balance']:,.0f}")
         
         with col4:
-            st.metric("Net Cash from Sale", f"${returns['net_cash_from_sale']:,.0f}")
+            st.metric(
+                "Net Cash (After Tax)", 
+                f"${returns['net_cash_from_sale']:,.0f}",
+                help="After paying off loan and taxes on sale"
+            )
+        
+        # Tax details on sale
+        st.markdown('<div class="sub-header">Tax on Sale Details</div>', unsafe_allow_html=True)
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Depreciation", f"${returns['total_depreciation']:,.0f}")
+        
+        with col2:
+            st.metric("Depreciation Recapture Tax", f"${returns['depreciation_recapture_tax']:,.0f}")
+        
+        with col3:
+            st.metric("Capital Gains Tax", f"${returns['capital_gains_tax']:,.0f}")
+        
+        with col4:
+            st.metric("Total Tax on Sale", f"${returns['total_tax_on_sale']:,.0f}")
     
     with tab2:
         st.plotly_chart(plot_revenue_expense_stack(pro_forma), use_container_width=True)
-        st.plotly_chart(plot_cumulative_cash_flow(pro_forma, inputs), use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.plotly_chart(plot_annual_cash_flow(pro_forma), use_container_width=True)
+        
+        with col2:
+            st.plotly_chart(plot_cumulative_cash_flow(pro_forma, inputs), use_container_width=True)
         
         # Cash-on-Cash by year
-        st.markdown('<div class="sub-header">Annual Cash-on-Cash Returns</div>', unsafe_allow_html=True)
-        coc_df = pro_forma[pro_forma['Year'] > 0][['Year', 'Cash_on_Cash']].copy()
+        st.markdown('<div class="sub-header">Annual Cash-on-Cash Returns (After-Tax)</div>', unsafe_allow_html=True)
+        coc_df = pro_forma[pro_forma['Year'] > 0][['Year', 'After_Tax_CoC']].copy()
         
         fig = px.bar(
             coc_df,
             x='Year',
-            y='Cash_on_Cash',
-            title='Cash-on-Cash Return by Year',
-            labels={'Cash_on_Cash': 'Cash-on-Cash (%)'},
-            color='Cash_on_Cash',
+            y='After_Tax_CoC',
+            title='After-Tax Cash-on-Cash Return by Year',
+            labels={'After_Tax_CoC': 'After-Tax CoC (%)'},
+            color='After_Tax_CoC',
             color_continuous_scale='RdYlGn'
         )
         fig.update_yaxes(tickformat='.1%')
