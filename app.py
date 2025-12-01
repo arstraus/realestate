@@ -281,10 +281,6 @@ class PropertyInputs:
     purchase_price: float
     closing_costs_pct: float
     
-    # Tenant Details (new)
-    use_detailed_tenants: bool = False
-    tenants: List[Tenant] = field(default_factory=list)
-    
     # Financing
     down_payment_pct: float
     interest_rate: float
@@ -317,6 +313,10 @@ class PropertyInputs:
     exit_cap_rate: float
     sale_costs_pct: float
     discount_rate: float
+    
+    # Tenant Details (with defaults - must be last)
+    use_detailed_tenants: bool = False
+    tenants: List[Tenant] = field(default_factory=list)
     
     @property
     def price_per_sf(self) -> float:
