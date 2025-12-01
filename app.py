@@ -3,12 +3,19 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Tuple, Optional
 import numpy_financial as npf
 import json
 from pathlib import Path
 from datetime import datetime
+import io
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
 # Page configuration
 st.set_page_config(
@@ -254,12 +261,29 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 @dataclass
+class Tenant:
+    """Individual tenant details"""
+    name: str
+    square_feet: float
+    annual_rent_psf: float
+    lease_expiration_year: int
+    
+    @property
+    def annual_rent(self) -> float:
+        return self.square_feet * self.annual_rent_psf
+
+
+@dataclass
 class PropertyInputs:
     """Store all property input parameters"""
     # Property Details
     building_size: float
     purchase_price: float
     closing_costs_pct: float
+    
+    # Tenant Details (new)
+    use_detailed_tenants: bool = False
+    tenants: List[Tenant] = field(default_factory=list)
     
     # Financing
     down_payment_pct: float
@@ -321,6 +345,225 @@ class PropertyInputs:
         return self.annual_debt_service / 12
 
 
+def analyze_debt_optimization(base_inputs: PropertyInputs) -> pd.DataFrame:
+    """Analyze IRR across different leverage levels"""
+    results = []
+    
+    # Test leverage from 0% to 90% in 5% increments
+    for ltv in np.arange(0.0, 0.95, 0.05):
+        # Create modified inputs with different leverage
+        test_inputs = PropertyInputs(**asdict(base_inputs))
+        test_inputs.down_payment_pct = 1 - ltv
+        
+        # Skip if down payment is less than minimum
+        if test_inputs.down_payment_pct < 0.05:
+            continue
+        
+        # Calculate returns
+        try:
+            analyzer = CREAnalyzer(test_inputs)
+            analyzer.calculate_pro_forma()
+            returns = analyzer.calculate_returns()
+            
+            # Collect metrics
+            results.append({
+                'LTV': ltv * 100,
+                'Down_Payment_Pct': test_inputs.down_payment_pct * 100,
+                'Equity_Required': test_inputs.equity_required,
+                'Loan_Amount': test_inputs.loan_amount,
+                'After_Tax_IRR': returns['after_tax_irr'] * 100,
+                'Pre_Tax_IRR': returns['pre_tax_irr'] * 100,
+                'After_Tax_EM': returns['after_tax_equity_multiple'],
+                'Year1_DSCR': returns['year1_dscr'],
+                'After_Tax_CoC': returns['year1_after_tax_coc'] * 100,
+                'Debt_Service': test_inputs.annual_debt_service
+            })
+        except:
+            # Skip if calculation fails (e.g., negative cash flow)
+            continue
+    
+    return pd.DataFrame(results)
+
+
+def generate_pdf_report(inputs: PropertyInputs, returns: Dict, pro_forma: pd.DataFrame) -> bytes:
+    """Generate PDF executive summary report"""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter,
+                           topMargin=0.5*inch, bottomMargin=0.5*inch,
+                           leftMargin=0.75*inch, rightMargin=0.75*inch)
+    
+    # Container for the 'Flowable' objects
+    elements = []
+    
+    # Define styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#667eea'),
+        spaceAfter=30,
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        textColor=colors.HexColor('#1a202c'),
+        spaceAfter=12,
+        spaceBefore=12,
+        fontName='Helvetica-Bold'
+    )
+    
+    # Title
+    elements.append(Paragraph("Commercial Real Estate", title_style))
+    elements.append(Paragraph("Investment Analysis Summary", title_style))
+    elements.append(Spacer(1, 0.3*inch))
+    
+    # Property Overview
+    elements.append(Paragraph("Property Overview", heading_style))
+    property_data = [
+        ['Building Size', f"{inputs.building_size:,.0f} SF"],
+        ['Purchase Price', f"${inputs.purchase_price:,.0f}"],
+        ['Price per SF', f"${inputs.price_per_sf:.2f}"],
+        ['Total Acquisition Cost', f"${inputs.total_acquisition_cost:,.0f}"],
+    ]
+    
+    property_table = Table(property_data, colWidths=[3*inch, 2*inch])
+    property_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a202c')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0'))
+    ]))
+    elements.append(property_table)
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Financing Structure
+    elements.append(Paragraph("Financing Structure", heading_style))
+    financing_data = [
+        ['Equity Required', f"${inputs.equity_required:,.0f}"],
+        ['Loan Amount', f"${inputs.loan_amount:,.0f}"],
+        ['LTV', f"{(1-inputs.down_payment_pct)*100:.1f}%"],
+        ['Interest Rate', f"{inputs.interest_rate*100:.2f}%"],
+        ['Loan Term', f"{inputs.loan_term_years} years"],
+        ['Annual Debt Service', f"${inputs.annual_debt_service:,.0f}"],
+    ]
+    
+    financing_table = Table(financing_data, colWidths=[3*inch, 2*inch])
+    financing_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a202c')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0'))
+    ]))
+    elements.append(financing_table)
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Investment Returns - After-Tax
+    elements.append(Paragraph("After-Tax Investment Returns", heading_style))
+    returns_data = [
+        ['After-Tax IRR', f"{returns['after_tax_irr']*100:.2f}%"],
+        ['Equity Multiple', f"{returns['after_tax_equity_multiple']:.2f}x"],
+        ['Avg Cash-on-Cash', f"{returns['after_tax_avg_coc']*100:.2f}%"],
+        ['After-Tax NPV', f"${returns['after_tax_npv']:,.0f}"],
+        ['Total Profit', f"${returns['after_tax_profit']:,.0f}"],
+    ]
+    
+    returns_table = Table(returns_data, colWidths=[3*inch, 2*inch])
+    returns_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0f4ff')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a202c')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (1, 0), (1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('FONTSIZE', (1, 0), (1, 0), 12),
+        ('TEXTCOLOR', (1, 0), (1, 0), colors.HexColor('#667eea')),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0'))
+    ]))
+    elements.append(returns_table)
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Year 1 Metrics
+    elements.append(Paragraph("Year 1 Performance Metrics", heading_style))
+    year1_data = [
+        ['Year 1 NOI', f"${returns['year1_noi']:,.0f}"],
+        ['Going-In Cap Rate', f"{returns['going_in_cap_rate']*100:.2f}%"],
+        ['Year 1 DSCR', f"{returns['year1_dscr']:.2f}"],
+        ['Year 1 After-Tax CoC', f"{returns['year1_after_tax_coc']*100:.2f}%"],
+    ]
+    
+    year1_table = Table(year1_data, colWidths=[3*inch, 2*inch])
+    year1_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a202c')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0'))
+    ]))
+    elements.append(year1_table)
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Exit Analysis
+    elements.append(Paragraph("Exit Analysis", heading_style))
+    exit_data = [
+        ['Gross Sale Price', f"${returns['gross_sale_price']:,.0f}"],
+        ['Net Sale Proceeds', f"${returns['net_sale_proceeds']:,.0f}"],
+        ['Loan Balance at Exit', f"${returns['loan_balance']:,.0f}"],
+        ['Total Tax on Sale', f"${returns['total_tax_on_sale']:,.0f}"],
+        ['Net Cash from Sale', f"${returns['net_cash_from_sale']:,.0f}"],
+    ]
+    
+    exit_table = Table(exit_data, colWidths=[3*inch, 2*inch])
+    exit_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f7fafc')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1a202c')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0'))
+    ]))
+    elements.append(exit_table)
+    elements.append(Spacer(1, 0.3*inch))
+    
+    # Add footer
+    footer_style = ParagraphStyle(
+        'Footer',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=colors.HexColor('#64748b'),
+        alignment=TA_CENTER
+    )
+    elements.append(Spacer(1, 0.2*inch))
+    elements.append(Paragraph(f"Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}", footer_style))
+    elements.append(Paragraph("Commercial Real Estate Investment Analyzer", footer_style))
+    
+    # Build PDF
+    doc.build(elements)
+    
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+
 def save_scenario(inputs: PropertyInputs, scenario_name: str, filename: Optional[str] = None) -> str:
     """Save scenario inputs to JSON file"""
     if filename is None:
@@ -335,10 +578,16 @@ def save_scenario(inputs: PropertyInputs, scenario_name: str, filename: Optional
         filename = f"scenarios/{safe_name}_{timestamp}.json"
     
     # Convert to dict and add metadata
+    inputs_dict = asdict(inputs)
+    
+    # Convert tenant objects to dicts if present
+    if 'tenants' in inputs_dict and inputs_dict['tenants']:
+        inputs_dict['tenants'] = [asdict(t) if hasattr(t, '__dict__') else t for t in inputs_dict['tenants']]
+    
     scenario_data = {
         'name': scenario_name,
         'created_at': datetime.now().isoformat(),
-        'inputs': asdict(inputs)
+        'inputs': inputs_dict
     }
     
     # Save to file
@@ -355,6 +604,12 @@ def load_scenario(filename: str) -> Tuple[str, PropertyInputs]:
     
     scenario_name = scenario_data.get('name', 'Unnamed Scenario')
     inputs_dict = scenario_data['inputs']
+    
+    # Convert tenant dicts to Tenant objects if present
+    if 'tenants' in inputs_dict and inputs_dict['tenants']:
+        inputs_dict['tenants'] = [Tenant(**t) for t in inputs_dict['tenants']]
+    else:
+        inputs_dict['tenants'] = []
     
     # Convert dict to PropertyInputs
     inputs = PropertyInputs(**inputs_dict)
@@ -396,22 +651,54 @@ class CREAnalyzer:
             year_data = {'Year': year}
             
             # Revenue calculations
-            if year == 0:
-                rent_psf = 0
-                occupancy = 0
-                occupied_sf = 0
-            elif year == 1:
-                rent_psf = self.inputs.annual_rent_psf
-                occupancy = self.inputs.year1_occupancy
-                occupied_sf = self.inputs.building_size * occupancy
+            if self.inputs.use_detailed_tenants and self.inputs.tenants:
+                # Tenant-by-tenant revenue calculation
+                if year == 0:
+                    gross_rental_income = 0
+                    occupied_sf = 0
+                    rent_psf = 0
+                else:
+                    gross_rental_income = 0
+                    occupied_sf = 0
+                    
+                    for tenant in self.inputs.tenants:
+                        # Check if lease has expired
+                        if year <= tenant.lease_expiration_year:
+                            # Tenant still in place
+                            tenant_rent = tenant.annual_rent * ((1 + self.inputs.rent_growth_rate) ** (year - 1))
+                            gross_rental_income += tenant_rent
+                            occupied_sf += tenant.square_feet
+                        else:
+                            # Lease expired - assume re-leased at market after 6 months vacancy
+                            market_rent = tenant.annual_rent_psf * ((1 + self.inputs.rent_growth_rate) ** (year - 1))
+                            # 50% of year vacant, 50% at market
+                            tenant_rent = tenant.square_feet * market_rent * 0.5
+                            gross_rental_income += tenant_rent
+                            occupied_sf += tenant.square_feet * 0.5
+                    
+                    # Calculate weighted average rent
+                    rent_psf = gross_rental_income / occupied_sf if occupied_sf > 0 else 0
+                
+                other_income = gross_rental_income * self.inputs.other_income_pct
+                total_revenue = gross_rental_income + other_income
             else:
-                rent_psf = self.inputs.annual_rent_psf * ((1 + self.inputs.rent_growth_rate) ** (year - 1))
-                occupancy = self.inputs.stabilized_occupancy
-                occupied_sf = self.inputs.building_size * occupancy
-            
-            gross_rental_income = occupied_sf * rent_psf
-            other_income = gross_rental_income * self.inputs.other_income_pct
-            total_revenue = gross_rental_income + other_income
+                # Simple single-tenant/blended calculation
+                if year == 0:
+                    rent_psf = 0
+                    occupancy = 0
+                    occupied_sf = 0
+                elif year == 1:
+                    rent_psf = self.inputs.annual_rent_psf
+                    occupancy = self.inputs.year1_occupancy
+                    occupied_sf = self.inputs.building_size * occupancy
+                else:
+                    rent_psf = self.inputs.annual_rent_psf * ((1 + self.inputs.rent_growth_rate) ** (year - 1))
+                    occupancy = self.inputs.stabilized_occupancy
+                    occupied_sf = self.inputs.building_size * occupancy
+                
+                gross_rental_income = occupied_sf * rent_psf
+                other_income = gross_rental_income * self.inputs.other_income_pct
+                total_revenue = gross_rental_income + other_income
             
             # Operating Expenses (Reimbursed)
             if year == 0:
@@ -795,32 +1082,99 @@ def create_inputs_sidebar() -> PropertyInputs:
         )
     
     with st.sidebar.expander("REVENUE ASSUMPTIONS", expanded=True):
-        annual_rent_psf = st.number_input(
-            "Annual Base Rent per SF (NNN) ($)",
-            min_value=1.0,
-            value=float(default_inputs.annual_rent_psf) if default_inputs else 18.0,
-            step=0.5
+        use_detailed_tenants = st.checkbox(
+            "Use Detailed Tenant Input",
+            value=default_inputs.use_detailed_tenants if default_inputs else False,
+            help="Model individual tenants with specific lease terms"
         )
+        
+        tenants = []
+        
+        if use_detailed_tenants:
+            st.markdown("**Tenant Details**")
+            num_tenants = st.number_input("Number of Tenants", min_value=1, max_value=20, value=1, step=1)
+            
+            for i in range(num_tenants):
+                st.markdown(f"*Tenant {i+1}*")
+                col1, col2 = st.columns(2)
+                with col1:
+                    tenant_sf = st.number_input(
+                        f"SF",
+                        min_value=0,
+                        value=int(building_size / num_tenants) if building_size else 10000,
+                        step=1000,
+                        key=f"tenant_{i}_sf"
+                    )
+                    tenant_rent = st.number_input(
+                        f"Rent/SF ($)",
+                        min_value=0.0,
+                        value=18.0,
+                        step=0.5,
+                        key=f"tenant_{i}_rent"
+                    )
+                with col2:
+                    tenant_name = st.text_input(
+                        f"Name",
+                        value=f"Tenant {i+1}",
+                        key=f"tenant_{i}_name"
+                    )
+                    lease_exp = st.number_input(
+                        f"Lease Exp (Year)",
+                        min_value=1,
+                        max_value=30,
+                        value=5,
+                        step=1,
+                        key=f"tenant_{i}_exp"
+                    )
+                
+                tenants.append(Tenant(
+                    name=tenant_name,
+                    square_feet=tenant_sf,
+                    annual_rent_psf=tenant_rent,
+                    lease_expiration_year=lease_exp
+                ))
+            
+            # Show total
+            total_sf = sum(t.square_feet for t in tenants)
+            total_rent = sum(t.annual_rent for t in tenants)
+            avg_rent_psf = total_rent / total_sf if total_sf > 0 else 0
+            
+            st.metric("Total Leased SF", f"{total_sf:,.0f}")
+            st.metric("Avg Rent/SF", f"${avg_rent_psf:.2f}")
+            
+            # Use weighted average for blended calculations
+            annual_rent_psf = avg_rent_psf
+            year1_occupancy = total_sf / building_size if building_size > 0 else 0.9
+            stabilized_occupancy = year1_occupancy
+        else:
+            # Simple mode
+            annual_rent_psf = st.number_input(
+                "Annual Base Rent per SF (NNN) ($)",
+                min_value=1.0,
+                value=float(default_inputs.annual_rent_psf) if default_inputs else 18.0,
+                step=0.5
+            )
+            year1_occupancy = st.slider(
+                "Year 1 Occupancy (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(default_inputs.year1_occupancy * 100) if default_inputs else 90.0,
+                step=5.0
+            ) / 100
+            stabilized_occupancy = st.slider(
+                "Stabilized Occupancy (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(default_inputs.stabilized_occupancy * 100) if default_inputs else 95.0,
+                step=5.0
+            ) / 100
+        
         rent_growth_rate = st.slider(
             "Rent Growth Rate (Annual %)",
             min_value=0.0,
             max_value=10.0,
             value=float(default_inputs.rent_growth_rate * 100) if default_inputs else 3.0,
             step=0.25
-        ) / 100
-        year1_occupancy = st.slider(
-            "Year 1 Occupancy (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(default_inputs.year1_occupancy * 100) if default_inputs else 90.0,
-            step=5.0
-        ) / 100
-        stabilized_occupancy = st.slider(
-            "Stabilized Occupancy (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(default_inputs.stabilized_occupancy * 100) if default_inputs else 95.0,
-            step=5.0
         ) / 100
         other_income_pct = st.slider(
             "Other Income (% of Rent)",
@@ -945,6 +1299,8 @@ def create_inputs_sidebar() -> PropertyInputs:
         building_size=building_size,
         purchase_price=purchase_price,
         closing_costs_pct=closing_costs_pct,
+        use_detailed_tenants=use_detailed_tenants,
+        tenants=tenants,
         down_payment_pct=down_payment_pct,
         interest_rate=interest_rate,
         loan_term_years=loan_term_years,
@@ -1495,14 +1851,26 @@ def main():
     returns = analyzer.calculate_returns()
     
     # Create tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Executive Summary",
         "Cash Flow Analysis",
+        "Debt Optimization",
         "Sensitivity Analysis",
         "Detailed Pro Forma"
     ])
     
     with tab1:
+        # PDF Export button at top
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col3:
+            pdf_bytes = generate_pdf_report(inputs, returns, pro_forma)
+            st.download_button(
+                label="Export PDF Report",
+                data=pdf_bytes,
+                file_name=f"investment_summary_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf"
+            )
+        
         st.markdown('<div class="sub-header">Investment Overview</div>', unsafe_allow_html=True)
         display_acquisition_summary(inputs)
         
@@ -1583,6 +1951,203 @@ def main():
         st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
+        st.markdown('<div class="sub-header">Debt Optimization Analysis</div>', unsafe_allow_html=True)
+        st.info("This analysis shows how different leverage levels impact your returns. Find the optimal debt-to-equity ratio for maximum IRR while maintaining acceptable risk levels.")
+        
+        # Run optimization
+        with st.spinner("Analyzing leverage scenarios..."):
+            opt_df = analyze_debt_optimization(inputs)
+        
+        if not opt_df.empty:
+            # Find optimal leverage
+            optimal_row = opt_df.loc[opt_df['After_Tax_IRR'].idxmax()]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric(
+                    "Optimal LTV",
+                    f"{optimal_row['LTV']:.0f}%",
+                    help="Loan-to-Value ratio that maximizes IRR"
+                )
+            
+            with col2:
+                st.metric(
+                    "Max After-Tax IRR",
+                    f"{optimal_row['After_Tax_IRR']:.2f}%",
+                    help="Highest achievable IRR at optimal leverage"
+                )
+            
+            with col3:
+                st.metric(
+                    "Equity at Optimal",
+                    f"${optimal_row['Equity_Required']:,.0f}",
+                    help="Equity required at optimal leverage"
+                )
+            
+            with col4:
+                st.metric(
+                    "DSCR at Optimal",
+                    f"{optimal_row['Year1_DSCR']:.2f}",
+                    help="Debt service coverage at optimal leverage"
+                )
+            
+            # IRR vs Leverage Chart
+            st.markdown("**IRR vs Leverage Level**")
+            
+            fig = go.Figure()
+            
+            # After-Tax IRR line
+            fig.add_trace(go.Scatter(
+                x=opt_df['LTV'],
+                y=opt_df['After_Tax_IRR'],
+                mode='lines+markers',
+                name='After-Tax IRR',
+                line=dict(color='#667eea', width=3),
+                marker=dict(size=8)
+            ))
+            
+            # Pre-Tax IRR line
+            fig.add_trace(go.Scatter(
+                x=opt_df['LTV'],
+                y=opt_df['Pre_Tax_IRR'],
+                mode='lines+markers',
+                name='Pre-Tax IRR',
+                line=dict(color='#9467bd', width=3, dash='dash'),
+                marker=dict(size=8)
+            ))
+            
+            # Mark optimal point
+            fig.add_trace(go.Scatter(
+                x=[optimal_row['LTV']],
+                y=[optimal_row['After_Tax_IRR']],
+                mode='markers',
+                name='Optimal Point',
+                marker=dict(size=15, color='#2ca02c', symbol='star')
+            ))
+            
+            fig.update_layout(
+                xaxis_title='Loan-to-Value (%)',
+                yaxis_title='IRR (%)',
+                hovermode='x unified',
+                template='plotly_white',
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Equity Multiple vs Leverage
+            st.markdown("**Equity Multiple vs Leverage Level**")
+            
+            fig2 = go.Figure()
+            
+            fig2.add_trace(go.Scatter(
+                x=opt_df['LTV'],
+                y=opt_df['After_Tax_EM'],
+                mode='lines+markers',
+                name='After-Tax EM',
+                line=dict(color='#667eea', width=3),
+                marker=dict(size=8),
+                fill='tozeroy'
+            ))
+            
+            fig2.update_layout(
+                xaxis_title='Loan-to-Value (%)',
+                yaxis_title='Equity Multiple (x)',
+                hovermode='x unified',
+                template='plotly_white',
+                height=400
+            )
+            
+            st.plotly_chart(fig2, use_container_width=True)
+            
+            # Risk vs Return Trade-off
+            st.markdown("**Risk vs Return Trade-off**")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # DSCR vs LTV
+                fig3 = go.Figure()
+                
+                # Color code by DSCR level
+                colors_dscr = ['#2ca02c' if dscr >= 1.25 else '#ff7f0e' if dscr >= 1.1 else '#d62728' 
+                              for dscr in opt_df['Year1_DSCR']]
+                
+                fig3.add_trace(go.Scatter(
+                    x=opt_df['LTV'],
+                    y=opt_df['Year1_DSCR'],
+                    mode='lines+markers',
+                    name='DSCR',
+                    line=dict(color='#ff7f0e', width=3),
+                    marker=dict(size=10, color=colors_dscr)
+                ))
+                
+                # Add DSCR threshold line
+                fig3.add_hline(y=1.25, line_dash="dash", line_color="green", 
+                              annotation_text="Lender Min (1.25x)")
+                
+                fig3.update_layout(
+                    title='Debt Service Coverage Ratio',
+                    xaxis_title='Loan-to-Value (%)',
+                    yaxis_title='DSCR (x)',
+                    template='plotly_white',
+                    height=350
+                )
+                
+                st.plotly_chart(fig3, use_container_width=True)
+            
+            with col2:
+                # Cash-on-Cash vs LTV
+                fig4 = go.Figure()
+                
+                fig4.add_trace(go.Scatter(
+                    x=opt_df['LTV'],
+                    y=opt_df['After_Tax_CoC'],
+                    mode='lines+markers',
+                    name='After-Tax CoC',
+                    line=dict(color='#1f77b4', width=3),
+                    marker=dict(size=10)
+                ))
+                
+                fig4.update_layout(
+                    title='Year 1 Cash-on-Cash Return',
+                    xaxis_title='Loan-to-Value (%)',
+                    yaxis_title='Cash-on-Cash (%)',
+                    template='plotly_white',
+                    height=350
+                )
+                
+                st.plotly_chart(fig4, use_container_width=True)
+            
+            # Detailed Table
+            st.markdown("**Leverage Scenario Comparison**")
+            
+            display_opt_df = opt_df.copy()
+            display_opt_df['Current'] = display_opt_df['LTV'].apply(
+                lambda x: '→' if abs(x - (1-inputs.down_payment_pct)*100) < 2 else ''
+            )
+            
+            # Format columns
+            display_opt_df['LTV'] = display_opt_df['LTV'].apply(lambda x: f"{x:.0f}%")
+            display_opt_df['Equity_Required'] = display_opt_df['Equity_Required'].apply(lambda x: f"${x:,.0f}")
+            display_opt_df['After_Tax_IRR'] = display_opt_df['After_Tax_IRR'].apply(lambda x: f"{x:.2f}%")
+            display_opt_df['After_Tax_EM'] = display_opt_df['After_Tax_EM'].apply(lambda x: f"{x:.2f}x")
+            display_opt_df['Year1_DSCR'] = display_opt_df['Year1_DSCR'].apply(lambda x: f"{x:.2f}")
+            display_opt_df['After_Tax_CoC'] = display_opt_df['After_Tax_CoC'].apply(lambda x: f"{x:.2f}%")
+            
+            display_columns = ['Current', 'LTV', 'Equity_Required', 'After_Tax_IRR', 
+                             'After_Tax_EM', 'Year1_DSCR', 'After_Tax_CoC']
+            display_opt_df = display_opt_df[display_columns]
+            display_opt_df.columns = ['', 'LTV', 'Equity Req', 'AT IRR', 'EM', 'DSCR', 'Y1 CoC']
+            
+            st.dataframe(display_opt_df, use_container_width=True, hide_index=True)
+            
+        else:
+            st.error("Unable to generate debt optimization analysis. Please check your inputs.")
+    
+    with tab4:
         display_sensitivity_analysis(inputs)
         
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
@@ -1594,7 +2159,7 @@ def main():
         - Use these tables to understand which variables have the greatest impact on your returns
         """)
     
-    with tab4:
+    with tab5:
         display_pro_forma_table(pro_forma)
         
         # Export functionality
