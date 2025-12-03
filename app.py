@@ -1702,6 +1702,144 @@ def create_sensitivity_table(inputs: PropertyInputs, param1: str, param2: str,
     return df
 
 
+def compare_scenarios(current_inputs: PropertyInputs, saved_inputs: PropertyInputs) -> pd.DataFrame:
+    """Compare two scenarios and return a difference dataframe"""
+    
+    # Calculate returns for both
+    analyzer_curr = CREAnalyzer(current_inputs)
+    analyzer_curr.calculate_pro_forma()
+    returns_curr = analyzer_curr.calculate_returns()
+    
+    analyzer_saved = CREAnalyzer(saved_inputs)
+    analyzer_saved.calculate_pro_forma()
+    returns_saved = analyzer_saved.calculate_returns()
+    
+    # Define metrics to compare
+    metrics = [
+        ('Purchase Price', current_inputs.purchase_price, saved_inputs.purchase_price, 'currency'),
+        ('Equity Required', current_inputs.equity_required, saved_inputs.equity_required, 'currency'),
+        ('Loan Amount', current_inputs.loan_amount, saved_inputs.loan_amount, 'currency'),
+        ('Interest Rate', current_inputs.interest_rate, saved_inputs.interest_rate, 'percent'),
+        ('IRR (After-Tax)', returns_curr['after_tax_irr'], returns_saved['after_tax_irr'], 'percent'),
+        ('Equity Multiple', returns_curr['after_tax_equity_multiple'], returns_saved['after_tax_equity_multiple'], 'decimal'),
+        ('NPV', returns_curr['after_tax_npv'], returns_saved['after_tax_npv'], 'currency'),
+        ('Avg Cash-on-Cash', returns_curr['after_tax_avg_coc'], returns_saved['after_tax_avg_coc'], 'percent'),
+        ('Year 1 DSCR', returns_curr['year1_dscr'], returns_saved['year1_dscr'], 'decimal'),
+        ('Total Profit', returns_curr['after_tax_profit'], returns_saved['after_tax_profit'], 'currency'),
+    ]
+    
+    data = []
+    for name, curr, saved, fmt in metrics:
+        diff = curr - saved
+        
+        # Format values
+        if fmt == 'currency':
+            curr_str = f"${curr:,.0f}"
+            saved_str = f"${saved:,.0f}"
+            diff_str = f"${diff:,.0f}"
+        elif fmt == 'percent':
+            curr_str = f"{curr*100:.2f}%"
+            saved_str = f"{saved*100:.2f}%"
+            diff_str = f"{diff*100:.2f}%"
+        else:
+            curr_str = f"{curr:.2f}"
+            saved_str = f"{saved:.2f}"
+            diff_str = f"{diff:.2f}"
+            
+        data.append({
+            'Metric': name,
+            'Current Scenario': curr_str,
+            'Saved Scenario': saved_str,
+            'Difference': diff_str,
+            'raw_diff': diff  # For styling
+        })
+        
+    return pd.DataFrame(data)
+
+
+def generate_investment_memo(inputs: PropertyInputs, returns: Dict) -> str:
+    """Generate a rule-based investment memo"""
+    
+    irr = returns['after_tax_irr']
+    em = returns['after_tax_equity_multiple']
+    dscr = returns['year1_dscr']
+    coc = returns['year1_after_tax_coc']
+    
+    # Analyze Deal Quality
+    strengths = []
+    risks = []
+    
+    # IRR Analysis
+    if irr > 0.15:
+        strengths.append(f"Strong Internal Rate of Return ({irr*100:.1f}%) exceeds typical market targets.")
+    elif irr < 0.08:
+        risks.append(f"IRR of {irr*100:.1f}% is below typical core real estate thresholds.")
+        
+    # DSCR Analysis
+    if dscr < 1.20:
+        risks.append(f"Year 1 DSCR of {dscr:.2f}x is below standard lender requirements (1.25x), indicating cash flow risk.")
+    elif dscr > 1.5:
+        strengths.append(f"Healthy debt service coverage ({dscr:.2f}x) provides significant safety margin.")
+        
+    # Cash Flow Analysis
+    if coc < 0.04:
+        risks.append(f"Low initial cash-on-cash return ({coc*100:.1f}%) means heavy reliance on appreciation.")
+    elif coc > 0.08:
+        strengths.append(f"Strong Year 1 cash yield ({coc*100:.1f}%) provides immediate income.")
+        
+    # Leverage Analysis
+    ltv = 1 - inputs.down_payment_pct
+    if ltv > 0.75:
+        risks.append(f"High leverage ({ltv*100:.0f}% LTV) increases sensitivity to market downturns.")
+    elif ltv < 0.50:
+        strengths.append(f"Conservative leverage ({ltv*100:.0f}% LTV) reduces foreclosure risk.")
+        
+    # Recommendation
+    if len(risks) == 0 and irr > 0.12:
+        recommendation = "STRONG BUY"
+        summary = "This investment presents a compelling opportunity with strong returns and minimal flagged risks."
+    elif len(risks) > len(strengths):
+        recommendation = "HOLD / PASS"
+        summary = "This investment carries significant risks that may outweigh the projected returns. Re-evaluation of purchase price or financing terms is recommended."
+    else:
+        recommendation = "BUY (With Caution)"
+        summary = "The deal shows promise but has specific risk factors that should be mitigated."
+        
+    # Construct Memo
+    memo = f"""
+### 📝 Investment Memorandum
+
+**Recommendation: {recommendation}**
+
+{summary}
+
+#### 🟢 Key Strengths
+"""
+    for s in strengths:
+        memo += f"- {s}\n"
+        
+    if not strengths:
+        memo += "- No significant financial strengths identified based on current inputs.\n"
+        
+    memo += "\n#### ⚠️ Key Risks\n"
+    for r in risks:
+        memo += f"- {r}\n"
+        
+    if not risks:
+        memo += "- No major financial red flags identified.\n"
+        
+    memo += f"""
+#### 📊 Deal Metrics Summary
+- **IRR**: {irr*100:.2f}%
+- **Equity Multiple**: {em:.2f}x
+- **Year 1 DSCR**: {dscr:.2f}x
+- **Cash-on-Cash**: {coc*100:.2f}%
+- **Entry Price**: ${inputs.purchase_price:,.0f} (${inputs.price_per_sf:.0f}/SF)
+"""
+
+    return memo
+
+
 def display_sensitivity_analysis(inputs: PropertyInputs):
     """Display interactive sensitivity analysis"""
     st.markdown('<div class="sub-header">Sensitivity Analysis</div>', unsafe_allow_html=True)
@@ -1851,12 +1989,14 @@ def main():
     returns = analyzer.calculate_returns()
     
     # Create tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Executive Summary",
         "Cash Flow Analysis",
         "Debt Optimization",
         "Sensitivity Analysis",
-        "Detailed Pro Forma"
+        "Detailed Pro Forma",
+        "⚖️ Compare",
+        "🤖 AI Memo"
     ])
     
     with tab1:
@@ -2204,6 +2344,72 @@ def main():
                 file_name="investment_summary.csv",
                 mime="text/csv"
             )
+
+    with tab6:
+        st.markdown('<div class="sub-header">Scenario Comparison</div>', unsafe_allow_html=True)
+        
+        saved_scenarios = get_saved_scenarios()
+        if not saved_scenarios:
+            st.warning("No saved scenarios found. Please save a scenario first to compare.")
+        else:
+            # Scenario selector
+            scenario_options = []
+            for filepath in saved_scenarios:
+                try:
+                    with open(filepath, 'r') as f:
+                        data = json.load(f)
+                        name = data.get('name', 'Unnamed')
+                        scenario_options.append((name, filepath))
+                except:
+                    continue
+            
+            selected_name = st.selectbox(
+                "Select Scenario to Compare Against Current Inputs",
+                options=[opt[0] for opt in scenario_options]
+            )
+            
+            if selected_name:
+                # Find file path
+                selected_file = next(opt[1] for opt in scenario_options if opt[0] == selected_name)
+                _, saved_inputs = load_scenario(selected_file)
+                
+                # Generate comparison
+                comp_df = compare_scenarios(inputs, saved_inputs)
+                
+                # Display table with styling
+                st.dataframe(
+                    comp_df.drop(columns=['raw_diff']),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Visual comparison of IRR
+                st.markdown("**IRR Comparison**")
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=['Current', 'Saved'],
+                    y=[returns['after_tax_irr'], 
+                       CREAnalyzer(saved_inputs).calculate_returns()['after_tax_irr']],
+                    marker_color=['#667eea', '#a0aec0']
+                ))
+                fig.update_layout(
+                    yaxis_tickformat='.1%',
+                    template='plotly_white',
+                    height=300,
+                    title="Internal Rate of Return (IRR)"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab7:
+        st.markdown('<div class="sub-header">AI Investment Memo</div>', unsafe_allow_html=True)
+        st.info("This memo is automatically generated based on your deal metrics and standard underwriting criteria.")
+        
+        memo_text = generate_investment_memo(inputs, returns)
+        st.markdown(memo_text)
+        
+        # Copy button (simulated with code block)
+        st.markdown("### Copy to Clipboard")
+        st.code(memo_text, language="markdown")
 
 
 if __name__ == "__main__":
